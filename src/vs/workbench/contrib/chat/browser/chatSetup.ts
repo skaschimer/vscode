@@ -62,6 +62,7 @@ import { IWorkbenchEnvironmentService } from '../../../services/environment/comm
 import { isWeb } from '../../../../base/common/platform.js';
 import { ExtensionUrlHandlerOverrideRegistry } from '../../../services/extensions/browser/extensionUrlHandler.js';
 import { IWorkspaceTrustRequestService } from '../../../../platform/workspace/common/workspaceTrust.js';
+import { toErrorMessage } from '../../../../base/common/errorMessage.js';
 
 const defaultChat = {
 	extensionId: product.defaultChatAgent?.extensionId ?? '',
@@ -441,31 +442,46 @@ class ChatSetupRequests extends Disposable {
 	}
 
 	private async findMatchingProviderSession(token: CancellationToken): Promise<AuthenticationSession | undefined> {
-		let sessions: ReadonlyArray<AuthenticationSession> = [];
-		const authProviderConfigValue = this.configurationService.getValue<string | undefined>('github.copilot.advanced.authProvider');
-		if (authProviderConfigValue) {
-			sessions = await this.authenticationService.getSessions(authProviderConfigValue);
+		const authProviders: string[] = [];
+		const configuredAuthProvider = this.configurationService.getValue<string | undefined>('github.copilot.advanced.authProvider');
+		if (configuredAuthProvider) {
+			authProviders.push(configuredAuthProvider);
 		} else {
-			for (const providerId of defaultChat.providerIds) {
-				if (token.isCancellationRequested) {
-					return undefined;
-				}
-				sessions = await this.authenticationService.getSessions(providerId);
-				if (sessions.length) {
-					break;
-				}
-			}
+			authProviders.push(...defaultChat.providerIds);
 		}
 
-		for (const session of sessions) {
-			for (const scopes of defaultChat.providerScopes) {
-				if (this.scopesMatch(session.scopes, scopes)) {
-					return session;
+		let sessions: ReadonlyArray<AuthenticationSession> = [];
+		for (const authProvider of authProviders) {
+			if (token.isCancellationRequested) {
+				return undefined;
+			}
+
+			sessions = await this.doGetSessions(authProvider);
+
+			if (token.isCancellationRequested) {
+				return undefined;
+			}
+
+			for (const session of sessions) {
+				for (const scopes of defaultChat.providerScopes) {
+					if (this.scopesMatch(session.scopes, scopes)) {
+						return session;
+					}
 				}
 			}
 		}
 
 		return undefined;
+	}
+
+	private async doGetSessions(providerId: string): Promise<readonly AuthenticationSession[]> {
+		try {
+			return await this.authenticationService.getSessions(providerId);
+		} catch (error) {
+			// ignore - errors can throw if a provider is not registered
+		}
+
+		return [];
 	}
 
 	private scopesMatch(scopes: ReadonlyArray<string>, expectedScopes: string[]): boolean {
@@ -611,8 +627,8 @@ class ChatSetupRequests extends Disposable {
 
 		const response = await this.request(defaultChat.entitlementSignupLimitedUrl, 'POST', body, session, CancellationToken.None);
 		if (!response) {
-			this.onUnknownSignUpError('[chat setup] sign-up: no response');
-			return { errorCode: 1 };
+			const retry = await this.onUnknownSignUpError(localize('signUpNoResponseError', "No response received."), '[chat setup] sign-up: no response');
+			return retry ? this.signUpLimited(session) : { errorCode: 1 };
 		}
 
 		if (response.res.statusCode && response.res.statusCode !== 200) {
@@ -630,8 +646,8 @@ class ChatSetupRequests extends Disposable {
 					// ignore - handled below
 				}
 			}
-			this.onUnknownSignUpError(`[chat setup] sign-up: unexpected status code ${response.res.statusCode}`);
-			return { errorCode: response.res.statusCode };
+			const retry = await this.onUnknownSignUpError(localize('signUpUnexpectedStatusError', "Unexpected status code {0}.", response.res.statusCode), `[chat setup] sign-up: unexpected status code ${response.res.statusCode}`);
+			return retry ? this.signUpLimited(session) : { errorCode: response.res.statusCode };
 		}
 
 		let responseText: string | null = null;
@@ -642,8 +658,8 @@ class ChatSetupRequests extends Disposable {
 		}
 
 		if (!responseText) {
-			this.onUnknownSignUpError('[chat setup] sign-up: response has no content');
-			return { errorCode: 2 };
+			const retry = await this.onUnknownSignUpError(localize('signUpNoResponseContentsError', "Response has no contents."), '[chat setup] sign-up: response has no content');
+			return retry ? this.signUpLimited(session) : { errorCode: 2 };
 		}
 
 		let parsedResult: { subscribed: boolean } | undefined = undefined;
@@ -651,8 +667,8 @@ class ChatSetupRequests extends Disposable {
 			parsedResult = JSON.parse(responseText);
 			this.logService.trace(`[chat setup] sign-up: response is ${responseText}`);
 		} catch (err) {
-			this.onUnknownSignUpError(`[chat setup] sign-up: error parsing response (${err})`);
-			return { errorCode: 3 };
+			const retry = await this.onUnknownSignUpError(localize('signUpInvalidResponseError', "Invalid response contents."), `[chat setup] sign-up: error parsing response (${err})`);
+			return retry ? this.signUpLimited(session) : { errorCode: 3 };
 		}
 
 		// We have made it this far, so the user either did sign-up or was signed-up already.
@@ -662,12 +678,22 @@ class ChatSetupRequests extends Disposable {
 		return Boolean(parsedResult?.subscribed);
 	}
 
-	private onUnknownSignUpError(logMessage: string): void {
-		this.dialogService.error(localize('unknownSignUpError', "An error occurred while signing up for Copilot Free."), localize('unknownSignUpErrorDetail', "Please try again."));
+	private async onUnknownSignUpError(detail: string, logMessage: string): Promise<boolean> {
 		this.logService.error(logMessage);
+
+		const { confirmed } = await this.dialogService.confirm({
+			type: Severity.Error,
+			message: localize('unknownSignUpError', "An error occurred while signing up for Copilot Free. Would you like to try again?"),
+			detail,
+			primaryButton: localize('retry', "Retry")
+		});
+
+		return confirmed;
 	}
 
 	private onUnprocessableSignUpError(logMessage: string, logDetails: string): void {
+		this.logService.error(logMessage);
+
 		this.dialogService.prompt({
 			type: Severity.Error,
 			message: localize('unprocessableSignUpError', "An error occurred while signing up for Copilot Free."),
@@ -683,7 +709,6 @@ class ChatSetupRequests extends Disposable {
 				}
 			]
 		});
-		this.logService.error(logMessage);
 	}
 
 	override dispose(): void {
@@ -741,7 +766,8 @@ class ChatSetupController extends Disposable {
 		@IActivityService private readonly activityService: IActivityService,
 		@ICommandService private readonly commandService: ICommandService,
 		@IWorkbenchLayoutService private readonly layoutService: IWorkbenchLayoutService,
-		@IWorkspaceTrustRequestService private readonly workspaceTrustRequestService: IWorkspaceTrustRequestService
+		@IWorkspaceTrustRequestService private readonly workspaceTrustRequestService: IWorkspaceTrustRequestService,
+		@IDialogService private readonly dialogService: IDialogService
 	) {
 		super();
 
@@ -868,13 +894,7 @@ class ChatSetupController extends Disposable {
 				}
 			}
 
-			await this.extensionsWorkbenchService.install(defaultChat.extensionId, {
-				enable: true,
-				isApplicationScoped: true, 	// install into all profiles
-				isMachineScoped: false,		// do not ask to sync
-				installEverywhere: true,	// install in local and remote
-				installPreReleaseVersion: this.productService.quality !== 'stable'
-			}, isCopilotEditsViewActive(this.viewsService) ? EditsViewId : ChatViewId);
+			await this.doInstall();
 
 			installResult = 'installed';
 		} catch (error) {
@@ -895,6 +915,37 @@ class ChatSetupController extends Disposable {
 		}
 
 		this.telemetryService.publicLog2<InstallChatEvent, InstallChatClassification>('commandCenter.chatInstall', { installResult, signedIn, signUpErrorCode: undefined });
+	}
+
+	private async doInstall(): Promise<void> {
+		let error: Error | undefined;
+		try {
+			await this.extensionsWorkbenchService.install(defaultChat.extensionId, {
+				enable: true,
+				isApplicationScoped: true, 	// install into all profiles
+				isMachineScoped: false,		// do not ask to sync
+				installEverywhere: true,	// install in local and remote
+				installPreReleaseVersion: this.productService.quality !== 'stable'
+			}, isCopilotEditsViewActive(this.viewsService) ? EditsViewId : ChatViewId);
+		} catch (e) {
+			this.logService.error(`[chat setup] install: error ${error}`);
+			error = e;
+		}
+
+		if (error) {
+			const { confirmed } = await this.dialogService.confirm({
+				type: Severity.Error,
+				message: localize('unknownSetupError', "An error occurred while setting up Copilot. Would you like to try again?"),
+				detail: toErrorMessage(error),
+				primaryButton: localize('retry', "Retry")
+			});
+
+			if (confirmed) {
+				return this.doInstall();
+			}
+
+			throw error;
+		}
 	}
 }
 
