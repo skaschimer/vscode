@@ -46,6 +46,7 @@ import { IChatResponseModel } from '../../common/chatModel.js';
 import { IChatService } from '../../common/chatService.js';
 import { AbstractChatEditingModifiedFileEntry, IModifiedEntryTelemetryInfo, ISnapshotEntry } from './chatEditingModifiedFileEntry.js';
 import { createSnapshot, deserializeSnapshot, getNotebookSnapshotFileURI, restoreSnapshot, SnapshotComparer } from './notebook/chatEditingModifiedNotebookSnapshot.js';
+import { ChatEditingNewNotebookContentEdits } from './notebook/chatEditingNewNotebookContentEdits.js';
 import { ChatEditingNotebookCellEntry } from './notebook/chatEditingNotebookCellEntry.js';
 import { ChatEditingNotebookDiffEditorIntegration, ChatEditingNotebookEditorIntegration } from './notebook/chatEditingNotebookEditorIntegration.js';
 import { ChatEditingNotebookFileSystemProvider } from './notebook/chatEditingNotebookFileSystemProvider.js';
@@ -65,8 +66,12 @@ export class ChatEditingModifiedNotebookEntry extends AbstractChatEditingModifie
 	 */
 	override initialContent: string;
 	/**
-	 * Whether we're in the process of applying edits.
+	 * Whether we're still generating diffs from a response.
 	 */
+	private _isProcessingResponse = observableValue<boolean>('isProcessingResponse', false);
+	get isProcessingResponse(): IObservable<boolean> {
+		return this._isProcessingResponse;
+	}
 	private _isEditFromUs: boolean = false;
 	/**
 	 * Whether all edits are from us, e.g. is possible a user has made edits, then this will be false.
@@ -215,6 +220,7 @@ export class ChatEditingModifiedNotebookEntry extends AbstractChatEditingModifie
 		}
 		const cellsDiffInfo: CellDiffInfo[] = [];
 		try {
+			this._isProcessingResponse.set(true, undefined);
 			const notebookDiff = await this.notebookEditorWorkerService.computeDiff(this.originalURI, this.modifiedURI);
 			if (id !== this.computeRequestId) {
 				return;
@@ -225,6 +231,8 @@ export class ChatEditingModifiedNotebookEntry extends AbstractChatEditingModifie
 			}
 		} catch (ex) {
 			this.loggingService.error('Notebook Chat', 'Error computing diff:\n' + ex);
+		} finally {
+			this._isProcessingResponse.set(false, undefined);
 		}
 		this.initializeModelsFromDiffImpl(cellsDiffInfo);
 	}
@@ -419,7 +427,7 @@ export class ChatEditingModifiedNotebookEntry extends AbstractChatEditingModifie
 			return this._instantiationService.createInstance(ChatEditingNotebookDiffEditorIntegration, diffEditor, this._cellsDiffInfo);
 		}
 		assertType(notebookEditor);
-		return this._instantiationService.createInstance(ChatEditingNotebookEditorIntegration, this, notebookEditor, this.modifiedModel, this.originalModel, this._cellsDiffInfo);
+		return this._instantiationService.createInstance(ChatEditingNotebookEditorIntegration, this, editor, this.modifiedModel, this.originalModel, this._cellsDiffInfo);
 	}
 
 	protected override _resetEditsState(tx: ITransaction): void {
@@ -441,6 +449,7 @@ export class ChatEditingModifiedNotebookEntry extends AbstractChatEditingModifie
 		return new SnapshotComparer(snapshot).isEqual(this.modifiedModel);
 	}
 
+	private newNotebookEditGenerator?: ChatEditingNewNotebookContentEdits;
 	override async acceptAgentEdits(resource: URI, edits: (TextEdit | ICellEditOperation)[], isLastEdits: boolean, responseModel: IChatResponseModel): Promise<void> {
 		const isCellUri = resource.scheme === Schemas.vscodeNotebookCell;
 		const cell = isCellUri && this.modifiedModel.cells.find(cell => isEqual(cell.uri, resource));
@@ -470,12 +479,22 @@ export class ChatEditingModifiedNotebookEntry extends AbstractChatEditingModifie
 		await this._applyEdits(async () => {
 			edits.map(edit => {
 				if (TextEdit.isTextEdit(edit)) {
-					if (!this.editedCells.has(resource)) {
-						finishPreviousCells();
-						this.editedCells.add(resource);
+					// Possible we're getting the raw content for the notebook.
+					if (isEqual(resource, this.modifiedModel.uri)) {
+						this.newNotebookEditGenerator ??= this._instantiationService.createInstance(ChatEditingNewNotebookContentEdits, this.modifiedModel);
+						this.newNotebookEditGenerator.acceptTextEdits([edit]);
+					} else {
+						// If we get cell edits, its impossible to get text edits for the notebook uri.
+						this.newNotebookEditGenerator = undefined;
+						if (!this.editedCells.has(resource)) {
+							finishPreviousCells();
+							this.editedCells.add(resource);
+						}
+						cellEntry?.acceptAgentEdits([edit], isLastEdits, responseModel);
 					}
-					cellEntry?.acceptAgentEdits([edit], isLastEdits, responseModel);
 				} else {
+					// If we notebook edits, its impossible to get text edits for the notebook uri.
+					this.newNotebookEditGenerator = undefined;
 					this.acceptNotebookEdit(edit);
 				}
 			});
@@ -489,6 +508,14 @@ export class ChatEditingModifiedNotebookEntry extends AbstractChatEditingModifie
 		// isLastEdits can be true for cell Uris, but when its true for Cells edits.
 		// It cannot be true for the notebook itself.
 		isLastEdits = !isCellUri && isLastEdits;
+
+		// If this is the last edit and & we got regular text edits for generating new notebook content
+		// Then generate notebook edits from those text edits & apply those notebook edits.
+		if (isLastEdits && this.newNotebookEditGenerator) {
+			const notebookEdits = await this.newNotebookEditGenerator.generateEdits();
+			this.newNotebookEditGenerator = undefined;
+			notebookEdits.forEach(edit => this.acceptNotebookEdit(edit));
+		}
 
 		transaction((tx) => {
 			if (!isLastEdits) {
