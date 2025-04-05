@@ -222,7 +222,7 @@ export class InlineEditsLineReplacementView extends Disposable implements IInlin
 						style: {
 							position: 'absolute',
 							...rectToProps(reader => layout.read(reader).lowerBackground.translateX(-contentLeft)),
-							borderRadius: '4px',
+							borderRadius: '0 0 4px 4px',
 							background: asCssVariable(editorBackground),
 							boxShadow: `${asCssVariable(scrollbarShadow)} 0 6px 6px -6px`,
 							border: `1px solid ${asCssVariable(modifiedBorderColor)}`,
@@ -253,6 +253,9 @@ export class InlineEditsLineReplacementView extends Disposable implements IInlin
 							fontSize: this._editor.getOption(EditorOption.fontSize),
 							fontWeight: this._editor.getOption(EditorOption.fontWeight),
 							pointerEvents: 'none',
+							whiteSpace: 'nowrap',
+							borderRadius: '0 0 4px 4px',
+							overflow: 'hidden',
 						}
 					}, [...modifiedLineElements.lines]),
 				])
