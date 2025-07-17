@@ -1870,6 +1870,10 @@ have to be updated for changes to the rules above, or to support more deeply nes
 
 	.interactive-item-container.interactive-request {
 		align-items: flex-end;
+
+		.native-edit-context {
+			outline: none;
+		}
 	}
 
 	.interactive-item-container.interactive-request:not(.editing):hover .request-hover {
@@ -2068,10 +2072,6 @@ have to be updated for changes to the rules above, or to support more deeply nes
 
 		.request-hover {
 			top: 0px;
-		}
-
-		.request-hover.checkpoints-enabled {
-			top: 30px;
 		}
 
 		.checkpoint-container {
